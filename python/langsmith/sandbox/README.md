@@ -488,6 +488,75 @@ async with await client.sandbox(template_name="my-sandbox") as sb:
         conn = await asyncpg.connect(host="127.0.0.1", port=t.local_port)
 ```
 
+## Service URLs
+
+Access HTTP services running inside a sandbox without opening a TCP tunnel.
+`service()` returns a `ServiceURL` object with a short-lived JWT that
+auto-refreshes transparently. Built-in HTTP helpers inject the auth header
+for you.
+
+### Basic Usage
+
+```python
+with client.sandbox(template_name="my-sandbox") as sb:
+    # Start a web server inside the sandbox
+    handle = sb.run("python -m http.server 3000", timeout=0, wait=False)
+    import time; time.sleep(2)
+
+    # Get a service URL for port 3000
+    svc = sb.service(port=3000)
+
+    # Make requests — token is injected automatically
+    resp = svc.get("/")
+    print(resp.status_code)  # 200
+
+    # POST with JSON body
+    resp = svc.post("/api/data", json={"key": "value"})
+
+    # Access the raw token or URLs directly
+    print(svc.token)        # JWT (auto-refreshes near expiry)
+    print(svc.service_url)  # base URL for programmatic access
+    print(svc.browser_url)  # URL that sets a cookie in a browser
+
+    handle.kill()
+```
+
+### Custom Token TTL
+
+Tokens default to 10 minutes. Set `expires_in_seconds` for longer or shorter
+lifetimes (1 second to 24 hours):
+
+```python
+# Token valid for 1 hour
+svc = sb.service(port=3000, expires_in_seconds=3600)
+```
+
+### Auto-Refresh
+
+The `ServiceURL` object automatically refreshes its token before it expires.
+You never need to worry about token rotation — just keep using the object:
+
+```python
+svc = sb.service(port=3000, expires_in_seconds=60)
+
+# Even after 60 seconds, this still works — token refreshes transparently
+resp = svc.get("/api/status")
+```
+
+### Async Usage
+
+```python
+async with await client.sandbox(template_name="my-sandbox") as sb:
+    svc = await sb.service(port=3000)
+
+    # Async HTTP helpers
+    resp = await svc.get("/api/data")
+
+    # Async accessors for auto-refreshing properties
+    token = await svc.get_token()
+    url = await svc.get_service_url()
+```
+
 ## Templates
 
 Templates define the container image and resources for sandboxes. **You must create a template before you can create sandboxes.**
@@ -587,6 +656,65 @@ client.delete_pool("python-pool")
 ```
 
 > **Note:** Templates with volume mounts cannot be used in pools.
+
+## Sandbox Lifetime & TTL
+
+Control how long a sandbox stays alive with two optional TTL parameters:
+
+- **`ttl_seconds`** — Maximum lifetime from creation. The sandbox is automatically
+  deleted after this many seconds, regardless of activity.
+- **`idle_ttl_seconds`** — Idle timeout. The sandbox is automatically deleted after
+  this many seconds of inactivity. Activity (command execution, file I/O) resets
+  the timer.
+
+Both values must be multiples of 60 (minute-resolution). Pass `0` to explicitly
+disable a TTL. When both are set, whichever deadline comes first wins.
+
+```python
+# Create a sandbox that expires after 1 hour
+with client.sandbox(
+    template_name="my-sandbox",
+    ttl_seconds=3600,
+) as sb:
+    result = sb.run("echo hello")
+
+# Create a sandbox that expires after 10 min of inactivity
+sb = client.create_sandbox(
+    template_name="my-sandbox",
+    idle_ttl_seconds=600,
+)
+
+# Combine both: 2-hour max lifetime, 15-min idle timeout
+sb = client.create_sandbox(
+    template_name="my-sandbox",
+    ttl_seconds=7200,
+    idle_ttl_seconds=900,
+)
+
+# Check expiration
+print(sb.ttl_seconds)       # 7200
+print(sb.idle_ttl_seconds)  # 900
+print(sb.expires_at)        # e.g. "2026-03-24T14:00:00Z"
+```
+
+### Updating TTL on Existing Sandboxes
+
+You can update TTL values on an already-running sandbox:
+
+```python
+# Extend the idle timeout to 30 minutes
+sb = client.update_sandbox("my-sandbox", idle_ttl_seconds=1800)
+
+# Disable the absolute TTL (sandbox runs indefinitely, idle TTL still applies)
+sb = client.update_sandbox("my-sandbox", ttl_seconds=0)
+
+# Update name and TTL together
+sb = client.update_sandbox(
+    "my-sandbox",
+    new_name="my-sandbox-v2",
+    ttl_seconds=3600,
+)
+```
 
 ## Reusing Existing Sandboxes
 
@@ -719,13 +847,14 @@ except SandboxClientError as e:
 
 | Method | Description |
 |--------|-------------|
-| `sandbox(template_name, ...)` | Create a sandbox (auto-deleted on context exit) |
-| `create_sandbox(template_name, *, wait_for_ready=True, ...)` | Create a sandbox (requires explicit delete). Pass `wait_for_ready=False` for async creation. |
+| `sandbox(template_name, *, ttl_seconds=None, idle_ttl_seconds=None, ...)` | Create a sandbox (auto-deleted on context exit) |
+| `create_sandbox(template_name, *, wait_for_ready=True, ttl_seconds=None, idle_ttl_seconds=None, ...)` | Create a sandbox (requires explicit delete). Pass `wait_for_ready=False` for async creation. |
 | `get_sandbox(name)` | Get an existing sandbox by name |
 | `get_sandbox_status(name)` | Get lightweight provisioning status (`ResourceStatus`) |
 | `wait_for_sandbox(name, *, timeout=120, poll_interval=1.0)` | Poll until sandbox is ready or failed |
+| `service(name, port, *, expires_in_seconds=600)` | Get a `ServiceURL` for an HTTP service on the given port |
 | `list_sandboxes()` | List all sandboxes |
-| `update_sandbox(name, *, new_name)` | Update a sandbox's display name |
+| `update_sandbox(name, *, new_name=None, ttl_seconds=None, idle_ttl_seconds=None)` | Update a sandbox's name or TTL settings |
 | `delete_sandbox(name)` | Delete a sandbox |
 | `create_template(name, image, ...)` | Create a template |
 | `list_templates()` | List all templates |
@@ -751,6 +880,9 @@ except SandboxClientError as e:
 | `status_message` | Human-readable details when status is `"failed"`, `None` otherwise |
 | `dataplane_url` | URL for runtime operations (only functional when status is `"ready"`) |
 | `id` | Unique identifier (UUID) |
+| `ttl_seconds` | Maximum lifetime TTL in seconds (`0` means disabled, `None` means not set) |
+| `idle_ttl_seconds` | Idle timeout TTL in seconds (`0` means disabled, `None` means not set) |
+| `expires_at` | Computed expiration timestamp, or `None` if no TTL is active |
 
 | Method | Description |
 |--------|-------------|
@@ -759,6 +891,7 @@ except SandboxClientError as e:
 | `write(path, content)` | Write file (str or bytes) |
 | `read(path)` | Read file (returns bytes) |
 | `tunnel(remote_port, *, local_port=0)` | Open a TCP tunnel. Returns `Tunnel` (context manager). |
+| `service(port, *, expires_in_seconds=600)` | Get a `ServiceURL` for an HTTP service. Auto-refreshes token. |
 
 ### ExecutionResult
 
@@ -809,3 +942,28 @@ listener forwarding to a port inside the sandbox.
 | `local_port` | Local port the tunnel is listening on (int) |
 | `remote_port` | Target port inside the sandbox (int) |
 | `close()` | Shut down the tunnel and all connections |
+
+### ServiceURL
+
+Returned by `sb.service(port)`. Holds a short-lived JWT for accessing an HTTP
+service in the sandbox. Properties auto-refresh the token near expiry.
+
+| Property | Description |
+|----------|-------------|
+| `token` | Raw JWT for programmatic use (auto-refreshes) |
+| `service_url` | Base URL for programmatic HTTP access (auto-refreshes) |
+| `browser_url` | URL that exchanges the JWT for a cookie in a browser (auto-refreshes) |
+| `expires_at` | ISO 8601 expiration timestamp (auto-refreshes) |
+
+| Method | Description |
+|--------|-------------|
+| `request(method, path="/", **kwargs)` | Make an HTTP request with auth header injected. Returns `httpx.Response`. |
+| `get(path="/", **kwargs)` | HTTP GET |
+| `post(path="/", **kwargs)` | HTTP POST |
+| `put(path="/", **kwargs)` | HTTP PUT |
+| `patch(path="/", **kwargs)` | HTTP PATCH |
+| `delete(path="/", **kwargs)` | HTTP DELETE |
+
+`AsyncServiceURL` is the async variant. Use `await svc.get_token()`,
+`await svc.get_service_url()`, etc. for auto-refreshing access, and
+`await svc.get(path)` for async HTTP helpers.

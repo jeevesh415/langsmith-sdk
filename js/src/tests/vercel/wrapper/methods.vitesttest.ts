@@ -158,12 +158,20 @@ describe("wrapAISDK", () => {
         "ai_sdk_method",
         "ai.generateText"
       );
+      expect(generateTextRun.body.extra.metadata).toHaveProperty(
+        "ls_integration",
+        "vercel-ai-sdk"
+      );
 
       // The second createRun should be the low-level doGenerate call
       const doGenerateRun = mockHttpRequests[1];
       expect(doGenerateRun.body.extra.metadata).toHaveProperty(
         "ai_sdk_method",
         "ai.doGenerate"
+      );
+      expect(doGenerateRun.body.extra.metadata).toHaveProperty(
+        "ls_integration",
+        "vercel-ai-sdk"
       );
     });
 
@@ -227,6 +235,7 @@ describe("wrapAISDK", () => {
       const generateTextRun = mockHttpRequests[0];
       const updateTextRun = mockHttpRequests[3];
       expect(generateTextRun.body.extra.metadata).toMatchObject({
+        ls_integration: "vercel-ai-sdk",
         customField: "test-value",
         version: "2.0",
         ai_sdk_method: "ai.generateText",
@@ -2271,6 +2280,202 @@ describe("wrapAISDK", () => {
     });
   });
 
+  describe("reasoning-delta and content block aggregation", () => {
+    const finishChunk = (usage = {}) => ({
+      type: "finish" as const,
+      finishReason: { unified: "stop" as const, raw: "stop" },
+      usage: {
+        inputTokens: { total: 5, noCache: 5, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 5, text: 5, reasoning: 0 },
+        totalTokens: 10,
+        ...usage,
+      },
+    });
+
+    it.each([
+      {
+        scenario: "text-only flattens to string",
+        chunks: [
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "Just text" },
+          { type: "text-delta", id: "t-1", delta: ", nothing else" },
+          { type: "text-end", id: "t-1" },
+          finishChunk(),
+        ],
+        expectedContent: "Just text, nothing else",
+      },
+      {
+        scenario: "reasoning + text stays as block array",
+        chunks: [
+          { type: "reasoning-start", id: "r-1" },
+          { type: "reasoning-delta", id: "r-1", delta: "Let me think" },
+          { type: "reasoning-delta", id: "r-1", delta: " about this..." },
+          { type: "reasoning-end", id: "r-1" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "The answer is 42" },
+          { type: "text-end", id: "t-1" },
+          finishChunk(),
+        ],
+        expectedContent: [
+          { type: "reasoning", reasoning: "Let me think about this..." },
+          { type: "text", text: "The answer is 42" },
+        ],
+      },
+      {
+        scenario: "reasoning-only stays as block array",
+        chunks: [
+          { type: "reasoning-start", id: "r-1" },
+          {
+            type: "reasoning-delta",
+            id: "r-1",
+            delta: "Only reasoning, no text output",
+          },
+          { type: "reasoning-end", id: "r-1" },
+          finishChunk(),
+        ],
+        expectedContent: [
+          {
+            type: "reasoning",
+            reasoning: "Only reasoning, no text output",
+          },
+        ],
+      },
+      {
+        scenario: "interleaved reasoning and text blocks",
+        chunks: [
+          { type: "reasoning-start", id: "r-1" },
+          { type: "reasoning-delta", id: "r-1", delta: "First thought" },
+          { type: "reasoning-end", id: "r-1" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "Step one" },
+          { type: "text-end", id: "t-1" },
+          { type: "reasoning-start", id: "r-2" },
+          { type: "reasoning-delta", id: "r-2", delta: "Second thought" },
+          { type: "reasoning-end", id: "r-2" },
+          { type: "text-start", id: "t-2" },
+          { type: "text-delta", id: "t-2", delta: "Step two" },
+          { type: "text-end", id: "t-2" },
+          finishChunk(),
+        ],
+        expectedContent: [
+          { type: "reasoning", reasoning: "First thought" },
+          { type: "text", text: "Step one" },
+          { type: "reasoning", reasoning: "Second thought" },
+          { type: "text", text: "Step two" },
+        ],
+      },
+      {
+        scenario: "consecutive reasoning deltas merge into one block",
+        chunks: [
+          { type: "reasoning-start", id: "r-1" },
+          { type: "reasoning-delta", id: "r-1", delta: "Part A, " },
+          { type: "reasoning-delta", id: "r-1", delta: "Part B, " },
+          { type: "reasoning-delta", id: "r-1", delta: "Part C" },
+          { type: "reasoning-end", id: "r-1" },
+          { type: "text-start", id: "t-1" },
+          { type: "text-delta", id: "t-1", delta: "Done" },
+          { type: "text-end", id: "t-1" },
+          finishChunk(),
+        ],
+        expectedContent: [
+          { type: "reasoning", reasoning: "Part A, Part B, Part C" },
+          { type: "text", text: "Done" },
+        ],
+      },
+    ])("should handle $scenario", async ({ chunks, expectedContent }) => {
+      const wrappedMethods = wrapAISDK(
+        {
+          wrapLanguageModel: ai.wrapLanguageModel,
+          generateText: ai.generateText,
+          streamText: ai.streamText,
+          generateObject: ai.generateObject,
+          streamObject: ai.streamObject,
+        },
+        { client: mockClient as any }
+      );
+
+      const mockLangModel = new MockLanguageModelV3({
+        modelId: "content-block-test",
+        doStream: async () => ({
+          stream: simulateReadableStream({ chunks: chunks as any }),
+        }),
+      });
+
+      const result = wrappedMethods.streamText({
+        model: mockLangModel,
+        prompt: "test",
+      });
+
+      await result.consumeStream();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const doStreamUpdateRun = mockHttpRequests.find(
+        (req) =>
+          req.type === "updateRun" &&
+          req.body.extra?.metadata?.ai_sdk_method === "ai.doStream"
+      );
+
+      expect(doStreamUpdateRun).toBeDefined();
+      expect(doStreamUpdateRun.body.outputs.content).toEqual(expectedContent);
+    });
+
+    it("should preserve providerMetadata extras on reasoning blocks", async () => {
+      const wrappedMethods = wrapAISDK(
+        {
+          wrapLanguageModel: ai.wrapLanguageModel,
+          generateText: ai.generateText,
+          streamText: ai.streamText,
+          generateObject: ai.generateObject,
+          streamObject: ai.streamObject,
+        },
+        { client: mockClient as any }
+      );
+
+      const mockLangModel = new MockLanguageModelV3({
+        modelId: "reasoning-extras-test",
+        doStream: async () => ({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "reasoning-start", id: "r-1" },
+              {
+                type: "reasoning-delta",
+                id: "r-1",
+                delta: "Deep thought",
+                providerMetadata: { openai: { someFlag: true } },
+              },
+              { type: "reasoning-end", id: "r-1" },
+              { type: "text-start", id: "t-1" },
+              { type: "text-delta", id: "t-1", delta: "Result" },
+              { type: "text-end", id: "t-1" },
+              finishChunk(),
+            ],
+          }),
+        }),
+      });
+
+      const result = wrappedMethods.streamText({
+        model: mockLangModel,
+        prompt: "Think with extras",
+      });
+
+      await result.consumeStream();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const doStreamUpdateRun = mockHttpRequests.find(
+        (req) =>
+          req.type === "updateRun" &&
+          req.body.extra?.metadata?.ai_sdk_method === "ai.doStream"
+      );
+
+      expect(doStreamUpdateRun).toBeDefined();
+      expect(doStreamUpdateRun.body.outputs.content[0]).toMatchObject({
+        type: "reasoning",
+        reasoning: "Deep thought",
+        extras: { openai: { someFlag: true } },
+      });
+    });
+  });
+
   describe("ToolLoopAgent tracing", () => {
     it("should wrap ToolLoopAgent class correctly", async () => {
       const wrappedMethods = wrapAISDK(
@@ -2786,6 +2991,64 @@ describe("wrapAISDK", () => {
         doStreamUpdateRun.body.extra.metadata.usage_metadata
           .output_token_details.reasoning
       ).toBe(2);
+    });
+  });
+
+  describe("ls_agent_type metadata", () => {
+    it("should set ls_agent_type to 'root' at top level and 'subagent' inside a tool", async () => {
+      const wrappedMethods = wrapAISDK(
+        {
+          wrapLanguageModel: ai.wrapLanguageModel,
+          generateText: ai.generateText,
+          streamText: ai.streamText,
+          generateObject: ai.generateObject,
+          streamObject: ai.streamObject,
+        },
+        { client: mockClient as any }
+      );
+
+      // Top-level call should be "root"
+      await wrappedMethods.generateText({
+        model: standardMockedModel,
+        prompt: "Root prompt",
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 1));
+
+      const rootRun = mockHttpRequests.find(
+        (r: any) =>
+          r.type === "createRun" &&
+          r.body.extra?.metadata?.ai_sdk_method === "ai.generateText"
+      );
+      expect(rootRun).toBeDefined();
+      expect(rootRun.body.extra.metadata.ls_agent_type).toBe("root");
+
+      // Reset for next call
+      mockHttpRequests.length = 0;
+
+      // Call inside a tool should be "subagent"
+      const toolFunc = traceable(
+        async () => {
+          await wrappedMethods.generateText({
+            model: standardMockedModel,
+            prompt: "Subagent prompt",
+          });
+          return "tool result";
+        },
+        { name: "my_tool", run_type: "tool", client: mockClient as any }
+      );
+
+      await toolFunc();
+
+      await new Promise((resolve) => setTimeout(resolve, 1));
+
+      const subagentRun = mockHttpRequests.find(
+        (r: any) =>
+          r.type === "createRun" &&
+          r.body.extra?.metadata?.ai_sdk_method === "ai.generateText"
+      );
+      expect(subagentRun).toBeDefined();
+      expect(subagentRun.body.extra.metadata.ls_agent_type).toBe("subagent");
     });
   });
 });

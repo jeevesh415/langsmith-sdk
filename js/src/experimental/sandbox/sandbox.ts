@@ -29,6 +29,8 @@ import { reconnectWsStream, runWsStream } from "./ws_execute.js";
  *   await sandbox.delete();
  * }
  * ```
+ *
+ * @experimental This feature is experimental, and breaking changes are expected.
  */
 export class Sandbox {
   /** Display name (can be updated). */
@@ -47,6 +49,12 @@ export class Sandbox {
   readonly created_at?: string;
   /** Timestamp when the sandbox was last updated. */
   readonly updated_at?: string;
+  /** Maximum lifetime TTL in seconds (`0` means disabled). */
+  readonly ttl_seconds?: number;
+  /** Idle timeout TTL in seconds (`0` means disabled). */
+  readonly idle_ttl_seconds?: number;
+  /** Computed expiration timestamp when a TTL is active. */
+  readonly expires_at?: string;
 
   private _client: SandboxClient;
 
@@ -60,6 +68,9 @@ export class Sandbox {
     this.id = data.id;
     this.created_at = data.created_at;
     this.updated_at = data.updated_at;
+    this.ttl_seconds = data.ttl_seconds;
+    this.idle_ttl_seconds = data.idle_ttl_seconds;
+    this.expires_at = data.expires_at;
     this._client = client;
   }
 

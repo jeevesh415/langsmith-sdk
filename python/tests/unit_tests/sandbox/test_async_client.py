@@ -7,6 +7,7 @@ from pytest_httpx import HTTPXMock
 
 from langsmith.sandbox import (
     AsyncSandboxClient,
+    AsyncServiceURL,
     QuotaExceededError,
     ResourceAlreadyExistsError,
     ResourceCreationError,
@@ -367,6 +368,33 @@ class TestAsyncSandboxOperations:
             sandbox.dataplane_url == "https://sandbox-router.example.com/tenant/sb-123"
         )
 
+    async def test_create_sandbox_merges_custom_headers(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test per-request headers override default client headers."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes",
+            json={
+                "name": "test-sandbox",
+                "template_name": "python-sandbox",
+                "dataplane_url": "https://sandbox-router.example.com/tenant/sb-123",
+            },
+            status_code=201,
+        )
+
+        await client.create_sandbox(
+            template_name="python-sandbox",
+            headers={
+                "X-Api-Key": "override-key",
+                "X-Test-Header": "sandbox-client",
+            },
+        )
+
+        request = httpx_mock.get_request()
+        assert request.headers.get("X-Api-Key") == "override-key"
+        assert request.headers.get("X-Test-Header") == "sandbox-client"
+
     async def test_sandbox_async_context_manager(
         self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
     ):
@@ -621,6 +649,176 @@ class TestAsyncSandboxOperations:
             await client.wait_for_sandbox("my-sandbox", timeout=0, poll_interval=0.01)
 
         assert exc_info.value.last_status == "provisioning"
+
+    async def test_create_sandbox_with_ttl(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test creating a sandbox with TTL values."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes",
+            json={
+                "name": "test-sandbox",
+                "template_name": "python-sandbox",
+                "ttl_seconds": 3600,
+                "idle_ttl_seconds": 600,
+                "expires_at": "2026-03-24T12:00:00Z",
+                "dataplane_url": "https://sandbox-router.example.com/tenant/sb-123",
+            },
+            status_code=201,
+        )
+
+        sandbox = await client.create_sandbox(
+            template_name="python-sandbox",
+            ttl_seconds=3600,
+            idle_ttl_seconds=600,
+        )
+
+        assert sandbox.ttl_seconds == 3600
+        assert sandbox.idle_ttl_seconds == 600
+        assert sandbox.expires_at == "2026-03-24T12:00:00Z"
+
+        import json
+
+        request = httpx_mock.get_request()
+        payload = json.loads(request.content)
+        assert payload["ttl_seconds"] == 3600
+        assert payload["idle_ttl_seconds"] == 600
+
+    async def test_create_sandbox_ttl_omitted_when_none(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test TTL fields are omitted from payload when None."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes",
+            json={
+                "name": "test-sandbox",
+                "template_name": "python-sandbox",
+                "dataplane_url": "https://sandbox-router.example.com/tenant/sb-123",
+            },
+            status_code=201,
+        )
+
+        await client.create_sandbox(template_name="python-sandbox")
+
+        import json
+
+        request = httpx_mock.get_request()
+        payload = json.loads(request.content)
+        assert "ttl_seconds" not in payload
+        assert "idle_ttl_seconds" not in payload
+
+    async def test_create_sandbox_ttl_validation_negative(
+        self, client: AsyncSandboxClient
+    ):
+        """Test that negative TTL values raise ValueError."""
+        with pytest.raises(ValueError, match="must be >= 0"):
+            await client.create_sandbox(template_name="python-sandbox", ttl_seconds=-1)
+
+    async def test_create_sandbox_ttl_validation_not_multiple_of_60(
+        self, client: AsyncSandboxClient
+    ):
+        """Test that non-multiple-of-60 TTL values raise ValueError."""
+        with pytest.raises(ValueError, match="must be a multiple of 60"):
+            await client.create_sandbox(template_name="python-sandbox", ttl_seconds=90)
+
+    async def test_create_sandbox_ttl_zero_allowed(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test that TTL value of 0 is allowed (disables TTL)."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes",
+            json={
+                "name": "test-sandbox",
+                "template_name": "python-sandbox",
+                "ttl_seconds": 0,
+                "idle_ttl_seconds": 0,
+                "dataplane_url": "https://sandbox-router.example.com/tenant/sb-123",
+            },
+            status_code=201,
+        )
+
+        sandbox = await client.create_sandbox(
+            template_name="python-sandbox",
+            ttl_seconds=0,
+            idle_ttl_seconds=0,
+        )
+
+        assert sandbox.ttl_seconds == 0
+        assert sandbox.idle_ttl_seconds == 0
+
+    async def test_update_sandbox_with_ttl(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test updating a sandbox with TTL values."""
+        httpx_mock.add_response(
+            method="PATCH",
+            url="http://test-server:8080/boxes/my-sandbox",
+            json={
+                "name": "my-sandbox",
+                "template_name": "python-sandbox",
+                "ttl_seconds": 7200,
+                "idle_ttl_seconds": 1200,
+                "expires_at": "2026-03-24T14:00:00Z",
+                "dataplane_url": "https://sandbox-router.example.com/tenant/sb-123",
+            },
+        )
+
+        sandbox = await client.update_sandbox(
+            "my-sandbox",
+            ttl_seconds=7200,
+            idle_ttl_seconds=1200,
+        )
+
+        assert sandbox.ttl_seconds == 7200
+        assert sandbox.idle_ttl_seconds == 1200
+        assert sandbox.expires_at == "2026-03-24T14:00:00Z"
+
+        import json
+
+        request = httpx_mock.get_request()
+        payload = json.loads(request.content)
+        assert payload["ttl_seconds"] == 7200
+        assert payload["idle_ttl_seconds"] == 1200
+        assert "name" not in payload
+
+    async def test_update_sandbox_ttl_validation(self, client: AsyncSandboxClient):
+        """Test that invalid TTL values raise ValueError on update."""
+        with pytest.raises(ValueError, match="must be >= 0"):
+            await client.update_sandbox("my-sandbox", idle_ttl_seconds=-60)
+
+    async def test_update_sandbox_name_and_ttl(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test updating sandbox name and TTL simultaneously."""
+        httpx_mock.add_response(
+            method="PATCH",
+            url="http://test-server:8080/boxes/my-sandbox",
+            json={
+                "name": "my-sandbox-renamed",
+                "template_name": "python-sandbox",
+                "ttl_seconds": 3600,
+                "dataplane_url": "https://sandbox-router.example.com/tenant/sb-123",
+            },
+        )
+
+        sandbox = await client.update_sandbox(
+            "my-sandbox",
+            new_name="my-sandbox-renamed",
+            ttl_seconds=3600,
+        )
+
+        assert sandbox.name == "my-sandbox-renamed"
+        assert sandbox.ttl_seconds == 3600
+
+        import json
+
+        request = httpx_mock.get_request()
+        payload = json.loads(request.content)
+        assert payload["name"] == "my-sandbox-renamed"
+        assert payload["ttl_seconds"] == 3600
 
     async def test_list_sandboxes_includes_status(
         self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
@@ -1253,3 +1451,108 @@ class TestAsyncVolumeOperations:
 
         with pytest.raises(ResourceInUseError):
             await client.delete_volume("my-volume")
+
+
+class TestService:
+    """Tests for AsyncSandboxClient.service()."""
+
+    async def test_service_happy_path(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test getting a service URL returns AsyncServiceURL with correct fields."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes/my-sandbox/service-url",
+            json={
+                "browser_url": "http://uuid--3000.svc.example.com/_svc/auth?token=jwt",
+                "service_url": "http://uuid--3000.svc.example.com/",
+                "token": "jwt-token",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+
+        svc = await client.service("my-sandbox", 3000)
+
+        assert isinstance(svc, AsyncServiceURL)
+        assert svc.token == "jwt-token"
+        assert svc.service_url == "http://uuid--3000.svc.example.com/"
+        assert svc.expires_at == "2099-01-01T00:00:00Z"
+
+    async def test_service_custom_expiry(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test custom expires_in_seconds is sent in payload."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes/my-sandbox/service-url",
+            json={
+                "browser_url": "http://b",
+                "service_url": "http://s/",
+                "token": "t",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+
+        await client.service("my-sandbox", 3000, expires_in_seconds=3600)
+
+        request = httpx_mock.get_request()
+        assert request is not None
+        import json
+
+        body = json.loads(request.content)
+        assert body["port"] == 3000
+        assert body["expires_in_seconds"] == 3600
+
+    async def test_service_not_found(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test 404 raises ResourceNotFoundError."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes/nonexistent/service-url",
+            json={"detail": "Sandbox 'nonexistent' not found"},
+            status_code=404,
+        )
+
+        with pytest.raises(ResourceNotFoundError):
+            await client.service("nonexistent", 3000)
+
+    async def test_service_invalid_port(self, client: AsyncSandboxClient):
+        """Test port=0 raises ValueError."""
+        with pytest.raises(ValueError, match="positive integer"):
+            await client.service("my-sandbox", 0)
+
+    async def test_service_invalid_expiry(self, client: AsyncSandboxClient):
+        """Test expires_in_seconds=0 raises ValueError."""
+        with pytest.raises(ValueError, match="between 1 and 86400"):
+            await client.service("my-sandbox", 3000, expires_in_seconds=0)
+
+    async def test_service_has_refresher(
+        self, client: AsyncSandboxClient, httpx_mock: HTTPXMock
+    ):
+        """Test returned AsyncServiceURL has a working refresher."""
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes/my-sandbox/service-url",
+            json={
+                "browser_url": "http://b1",
+                "service_url": "http://s1/",
+                "token": "token-1",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="http://test-server:8080/boxes/my-sandbox/service-url",
+            json={
+                "browser_url": "http://b2",
+                "service_url": "http://s2/",
+                "token": "token-2",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+
+        svc = await client.service("my-sandbox", 3000)
+        assert svc._refresher is not None
+        fresh = await svc._refresher()
+        assert fresh._token == "token-2"

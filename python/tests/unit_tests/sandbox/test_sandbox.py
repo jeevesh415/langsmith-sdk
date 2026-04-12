@@ -1,5 +1,7 @@
 """Tests for Sandbox class."""
 
+from unittest.mock import MagicMock
+
 import pytest
 from pytest_httpx import HTTPXMock
 
@@ -9,6 +11,7 @@ from langsmith.sandbox import (
     SandboxClient,
     SandboxConnectionError,
     SandboxNotReadyError,
+    ServiceURL,
 )
 from langsmith.sandbox._sandbox import Sandbox
 
@@ -47,6 +50,58 @@ class TestSandboxProperties:
     def test_dataplane_url_property(self, sandbox):
         """Test dataplane_url property."""
         assert sandbox.dataplane_url == "https://sandbox-router.example.com/sb-123"
+
+
+class TestSandboxTTLFields:
+    """Tests for TTL fields on Sandbox."""
+
+    def test_from_dict_with_ttl(self, client):
+        """Test from_dict parses TTL fields."""
+        sb = Sandbox.from_dict(
+            data={
+                "name": "test-sandbox",
+                "template_name": "test-template",
+                "ttl_seconds": 3600,
+                "idle_ttl_seconds": 600,
+                "expires_at": "2026-03-24T12:00:00Z",
+            },
+            client=client,
+            auto_delete=False,
+        )
+        assert sb.ttl_seconds == 3600
+        assert sb.idle_ttl_seconds == 600
+        assert sb.expires_at == "2026-03-24T12:00:00Z"
+
+    def test_from_dict_without_ttl(self, client):
+        """Test from_dict defaults TTL fields to None when absent."""
+        sb = Sandbox.from_dict(
+            data={
+                "name": "test-sandbox",
+                "template_name": "test-template",
+            },
+            client=client,
+            auto_delete=False,
+        )
+        assert sb.ttl_seconds is None
+        assert sb.idle_ttl_seconds is None
+        assert sb.expires_at is None
+
+    def test_from_dict_with_zero_ttl(self, client):
+        """Test from_dict handles zero TTL values (TTL disabled)."""
+        sb = Sandbox.from_dict(
+            data={
+                "name": "test-sandbox",
+                "template_name": "test-template",
+                "ttl_seconds": 0,
+                "idle_ttl_seconds": 0,
+                "expires_at": None,
+            },
+            client=client,
+            auto_delete=False,
+        )
+        assert sb.ttl_seconds == 0
+        assert sb.idle_ttl_seconds == 0
+        assert sb.expires_at is None
 
 
 class TestSandboxStatusFields:
@@ -240,6 +295,26 @@ class TestSandboxRun:
         payload = json.loads(request.content)
         assert payload["env"] == {"MY_VAR": "hello", "OTHER": "value"}
 
+    def test_run_with_custom_headers(self, sandbox, httpx_mock: HTTPXMock):
+        """Test running a command with per-request headers."""
+        httpx_mock.add_response(
+            method="POST",
+            url="https://sandbox-router.example.com/sb-123/execute",
+            json={"stdout": "hello\n", "stderr": "", "exit_code": 0},
+        )
+
+        sandbox.run(
+            "echo hello",
+            headers={
+                "X-Api-Key": "override-key",
+                "X-Test-Header": "sandbox-run",
+            },
+        )
+
+        request = httpx_mock.get_request()
+        assert request.headers.get("X-Api-Key") == "override-key"
+        assert request.headers.get("X-Test-Header") == "sandbox-run"
+
     def test_run_with_cwd(self, sandbox, httpx_mock: HTTPXMock):
         """Test running a command with custom working directory."""
         import json
@@ -348,6 +423,23 @@ class TestSandboxWrite:
         assert binary_data in request.content
         content_type = request.headers.get("content-type", "")
         assert content_type.startswith("multipart/form-data")
+
+    def test_write_with_custom_headers(self, sandbox, httpx_mock: HTTPXMock):
+        """Test writing a file with per-request headers."""
+        httpx_mock.add_response(
+            method="POST",
+            url="https://sandbox-router.example.com/sb-123/upload?path=%2Fapp%2Ftest.txt",
+            json={"path": "/app/test.txt", "written": 5},
+        )
+
+        sandbox.write(
+            "/app/test.txt",
+            "hello",
+            headers={"X-Test-Header": "sandbox-write"},
+        )
+
+        request = httpx_mock.get_request()
+        assert request.headers.get("X-Test-Header") == "sandbox-write"
 
     def test_write_without_dataplane_url(self, client: SandboxClient):
         """Test write raises error when dataplane_url is not configured."""
@@ -476,3 +568,34 @@ class TestSandboxContextManager:
         # Verify no delete request
         requests = httpx_mock.get_requests()
         assert len(requests) == 0
+
+
+class TestSandboxService:
+    """Tests for Sandbox.service() convenience method."""
+
+    def test_service_delegates_to_client(self, client: SandboxClient):
+        """Test service() calls client.service() with sandbox name."""
+        mock_svc = ServiceURL(
+            browser_url="http://b",
+            service_url="http://s/",
+            token="t",
+            expires_at="2026-04-01T12:10:00Z",
+        )
+        client.service = MagicMock(return_value=mock_svc)  # type: ignore[method-assign]
+
+        sb = Sandbox.from_dict(
+            data={
+                "name": "test-sandbox",
+                "template_name": "test-template",
+                "dataplane_url": "https://sandbox-router.example.com/sb-123",
+            },
+            client=client,
+            auto_delete=False,
+        )
+
+        result = sb.service(port=3000, expires_in_seconds=1800)
+
+        client.service.assert_called_once_with(
+            "test-sandbox", 3000, expires_in_seconds=1800, headers=None
+        )
+        assert result is mock_svc
